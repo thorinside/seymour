@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+*.o
+*.dylib
+*.so
+*.dll
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Tool directories
+.agent/
+.claude/
+.opencode/
+
+# BMAD framework (optional - uncomment to track)
+# _bmad/
+
+# macOS
+.DS_Store
