@@ -17,8 +17,8 @@ build/
 .claude/
 .opencode/
 
-# BMAD framework (optional - uncomment to track)
-# _bmad/
+# BMAD framework
+_bmad/
 
 # macOS
 .DS_Store
