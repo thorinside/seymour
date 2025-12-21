@@ -31,7 +31,7 @@ SOFTWARE.
  * - Configurable 1-8 mono inputs via specification
  * - Per-input feedback control with CV modulation
  * - Per-input stereo panning with CV modulation
- * - Lookahead limiter with selectable saturation (Soft/Tube/Hard)
+ * - Lookahead limiter (0.5-20ms) with selectable saturation
  * - DC blocker in feedback path to prevent runaway
  */
 
@@ -44,39 +44,46 @@ SOFTWARE.
 // CONSTANTS
 // ============================================================================
 
-static const int kMaxInputs = 8;
-static const int kParamsPerChannel = 7;
-static const int kNumGlobalParams = 6;
+enum { kMaxChannels = 8 };
 
-// Limiter threshold (10V peak normalized to 1.0)
-static const float kLimiterThreshold = 1.0f;
+// Busses are in volts (see distingNT examples).
+static const float kLimiterThresholdMaxVolts = 10.0f; // least squash
+static const float kLimiterThresholdMinVolts = 1.0f;  // most squash
 
 // Maximum lookahead buffer size (20ms @ 96kHz, stereo interleaved)
-static const int kMaxLookaheadSamples = (96000 * 20) / 1000;  // 1920 samples
+static const int kMaxLookaheadSamples = (96000 * 20) / 1000;
+// Maximum feedback delay buffer size (20ms @ 96kHz, per channel)
+static const int kMaxFeedbackDelaySamples = (96000 * 20) / 1000;
 
 // ============================================================================
 // PARAMETER INDICES
 // ============================================================================
 
-// Per-channel parameter offsets
+// Global parameters (at the end)
+enum GlobalParams {
+    kParamOutputL,
+    kParamOutputR,
+    kParamOutputMode,
+    kParamMasterLevel,
+    kParamLookahead,
+    kParamSaturation,
+    kParamFeedbackDelay,
+    kParamSquash,
+
+    kNumGlobalParameters,
+};
+
+// Per-channel parameters
 enum ChannelParams {
-    kChParamInput = 0,
+    kChParamInput,
     kChParamFeedback,
     kChParamFeedbackCV,
     kChParamFeedbackCVDepth,
     kChParamPan,
     kChParamPanCV,
     kChParamPanCVDepth,
-};
 
-// Global parameter offsets (added after all channel params)
-enum GlobalParams {
-    kGlobalParamOutputL = 0,
-    kGlobalParamOutputR,
-    kGlobalParamOutputMode,
-    kGlobalParamMasterLevel,
-    kGlobalParamLookahead,
-    kGlobalParamSaturation,
+    kNumPerChannelParameters,
 };
 
 // Saturation modes
@@ -86,92 +93,41 @@ enum SaturationMode {
     kSaturationHard,
 };
 
-// Helper macros
-#define CHANNEL_PARAM(ch, param) ((ch) * kParamsPerChannel + (param))
-#define GLOBAL_PARAM_IDX(numInputs, param) ((numInputs) * kParamsPerChannel + (param))
-
 // ============================================================================
-// DATA STRUCTURES
+// PARAMETER TEMPLATES
 // ============================================================================
-
-/**
- * DTC (Data Tightly Coupled) memory - fast access for hot path
- */
-struct _seymourDTC {
-    // Limiter state
-    float envelope;
-    float gainReduction;
-
-    // Lookahead buffer state
-    uint32_t writeIndex;
-    uint32_t lookaheadSamples;
-    uint32_t bufferSize;  // Actual buffer size in samples
-
-    // Precomputed coefficients
-    float dcBlockerCoeff;
-    float envelopeAttack;
-    float envelopeRelease;
-    float smoothingCoeff;
-    float gainSmoothingCoeff;
-};
-
-/**
- * Main algorithm structure
- */
-struct _seymourAlgorithm : public _NT_algorithm {
-    _seymourAlgorithm() {}
-    ~_seymourAlgorithm() {}
-
-    // Configuration
-    int numInputs;
-
-    // Memory pointers
-    _seymourDTC* dtc;
-    float* lookaheadBuffer;  // DRAM - stereo interleaved [L0,R0,L1,R1,...]
-
-    // Per-channel state (in SRAM after this struct)
-    float* feedbackSmoothed;    // [numInputs]
-    float* panSmoothed;         // [numInputs]
-    float* feedbackState;       // [numInputs] - previous output for feedback
-    float* dcBlockerX1;         // [numInputs] - DC blocker x[n-1]
-    float* dcBlockerY1;         // [numInputs] - DC blocker y[n-1]
-
-    // Master level smoothing
-    float masterLevelSmoothed;
-};
-
-// ============================================================================
-// SPECIFICATIONS
-// ============================================================================
-
-static const _NT_specification specifications[] = {
-    {
-        .name = "Inputs",
-        .min = 1,
-        .max = 8,
-        .def = 2,
-        .type = kNT_typeGeneric
-    },
-};
-
-// ============================================================================
-// STATIC PARAMETER STORAGE
-// ============================================================================
-
-// We need to build parameters dynamically based on numInputs
-// These are static storage for the maximum case
-static _NT_parameter allParameters[kMaxInputs * kParamsPerChannel + kNumGlobalParams];
-static uint8_t channelPageParams[kMaxInputs][kParamsPerChannel];
-static uint8_t outputPageParams[kNumGlobalParams];
-static _NT_parameterPage allPages[kMaxInputs + 1];
-static _NT_parameterPages parameterPages;
-
-static const char* channelPageNames[kMaxInputs] = {
-    "Input 1", "Input 2", "Input 3", "Input 4",
-    "Input 5", "Input 6", "Input 7", "Input 8"
-};
 
 static const char* saturationStrings[] = { "Soft", "Tube", "Hard", NULL };
+
+// Global parameters template
+static const _NT_parameter globalParameters[] = {
+    { .name = "Out L", .min = 1, .max = 28, .def = 13, .unit = kNT_unitAudioOutput, .scaling = 0, .enumStrings = NULL },
+    { .name = "Out R", .min = 1, .max = 28, .def = 14, .unit = kNT_unitAudioOutput, .scaling = 0, .enumStrings = NULL },
+    { .name = "Mode", .min = 0, .max = 1, .def = 1, .unit = kNT_unitOutputMode, .scaling = 0, .enumStrings = NULL },
+    { .name = "Level", .min = 0, .max = 100, .def = 100, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+    { .name = "Lookahead", .min = 5, .max = 200, .def = 50, .unit = kNT_unitMs, .scaling = kNT_scaling10, .enumStrings = NULL },
+    { .name = "Saturation", .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = saturationStrings },
+    { .name = "FB Delay", .min = 5, .max = 200, .def = 50, .unit = kNT_unitMs, .scaling = kNT_scaling10, .enumStrings = NULL },
+    // 0% = least squash (higher threshold), 100% = most squash (lower threshold)
+    { .name = "Squash", .min = 0, .max = 100, .def = 56, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+};
+
+// Per-channel parameters template
+static const _NT_parameter perChannelParameters[] = {
+    { .name = "Input", .min = 0, .max = 28, .def = 1, .unit = kNT_unitAudioInput, .scaling = 0, .enumStrings = NULL },
+    { .name = "Feedback", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+    { .name = "FB CV", .min = 0, .max = 28, .def = 0, .unit = kNT_unitCvInput, .scaling = 0, .enumStrings = NULL },
+    { .name = "FB Depth", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+    { .name = "Pan", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+    { .name = "Pan CV", .min = 0, .max = 28, .def = 0, .unit = kNT_unitCvInput, .scaling = 0, .enumStrings = NULL },
+    { .name = "Pan Depth", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+};
+
+// Channel page names
+static char const * const channelPageNames[] = {
+    "Channel 1", "Channel 2", "Channel 3", "Channel 4",
+    "Channel 5", "Channel 6", "Channel 7", "Channel 8",
+};
 
 // ============================================================================
 // DSP FUNCTIONS
@@ -179,7 +135,6 @@ static const char* saturationStrings[] = { "Soft", "Tube", "Hard", NULL };
 
 /**
  * DC Blocker - simple 1-pole high-pass filter
- * y[n] = x[n] - x[n-1] + R * y[n-1]
  */
 static inline float dcBlock(float input, float& x1, float& y1, float R) {
     float output = input - x1 + R * y1;
@@ -190,25 +145,21 @@ static inline float dcBlock(float input, float& x1, float& y1, float R) {
 
 /**
  * Equal power panner
- * pan: -100 to +100
  */
 static inline void equalPowerPan(float pan, float& gainL, float& gainR) {
-    float p = (pan + 100.0f) / 200.0f;  // 0 to 1
-    float angle = p * 1.5707963f;        // 0 to π/2
+    float p = (pan + 100.0f) / 200.0f;
+    float angle = p * 1.5707963f;  // π/2
     gainL = cosf(angle);
     gainR = sinf(angle);
 }
 
 /**
- * Soft saturation (tanh) - symmetric, smooth
+ * Saturation functions
  */
 static inline float saturateSoft(float x) {
     return tanhf(x);
 }
 
-/**
- * Tube saturation - asymmetric, even harmonics
- */
 static inline float saturateTube(float x) {
     if (x >= 0.0f) {
         return tanhf(x * 0.8f) * 1.1f;
@@ -217,9 +168,6 @@ static inline float saturateTube(float x) {
     }
 }
 
-/**
- * Hard saturation - aggressive with soft knee
- */
 static inline float saturateHard(float x) {
     if (x > 1.0f) return 1.0f;
     if (x < -1.0f) return -1.0f;
@@ -228,9 +176,6 @@ static inline float saturateHard(float x) {
     return x;
 }
 
-/**
- * Saturation dispatcher
- */
 static inline float saturate(float x, int mode) {
     switch (mode) {
         case kSaturationSoft: return saturateSoft(x);
@@ -241,259 +186,159 @@ static inline float saturate(float x, int mode) {
 }
 
 // ============================================================================
-// PARAMETER BUILDING
+// DATA STRUCTURES
 // ============================================================================
 
 /**
- * Build the parameter array based on numInputs
+ * DTC memory - fast access for limiter state
  */
-static void buildParameters(int numInputs) {
-    int idx = 0;
-
-    // Per-channel parameters
-    for (int ch = 0; ch < numInputs; ++ch) {
-        // Input bus selector
-        allParameters[idx++] = {
-            .name = "Input",
-            .min = 0,
-            .max = 28,
-            .def = (int16_t)(ch + 1),  // Default to sequential inputs
-            .unit = kNT_unitAudioInput,
-            .scaling = 0,
-            .enumStrings = NULL
-        };
-
-        // Feedback amount
-        allParameters[idx++] = {
-            .name = "Feedback",
-            .min = 0,
-            .max = 100,
-            .def = 0,
-            .unit = kNT_unitPercent,
-            .scaling = 0,
-            .enumStrings = NULL
-        };
-
-        // Feedback CV input
-        allParameters[idx++] = {
-            .name = "FB CV",
-            .min = 0,
-            .max = 28,
-            .def = 0,
-            .unit = kNT_unitAudioInput,
-            .scaling = 0,
-            .enumStrings = NULL
-        };
-
-        // Feedback CV depth
-        allParameters[idx++] = {
-            .name = "FB Depth",
-            .min = 0,
-            .max = 100,
-            .def = 50,
-            .unit = kNT_unitPercent,
-            .scaling = 0,
-            .enumStrings = NULL
-        };
-
-        // Pan
-        allParameters[idx++] = {
-            .name = "Pan",
-            .min = -100,
-            .max = 100,
-            .def = 0,
-            .unit = kNT_unitNone,
-            .scaling = 0,
-            .enumStrings = NULL
-        };
-
-        // Pan CV input
-        allParameters[idx++] = {
-            .name = "Pan CV",
-            .min = 0,
-            .max = 28,
-            .def = 0,
-            .unit = kNT_unitAudioInput,
-            .scaling = 0,
-            .enumStrings = NULL
-        };
-
-        // Pan CV depth
-        allParameters[idx++] = {
-            .name = "Pan Depth",
-            .min = 0,
-            .max = 100,
-            .def = 50,
-            .unit = kNT_unitPercent,
-            .scaling = 0,
-            .enumStrings = NULL
-        };
-    }
-
-    // Global parameters
-
-    // Output L
-    allParameters[idx++] = {
-        .name = "Out L",
-        .min = 1,
-        .max = 28,
-        .def = 13,
-        .unit = kNT_unitAudioOutput,
-        .scaling = 0,
-        .enumStrings = NULL
-    };
-
-    // Output R
-    allParameters[idx++] = {
-        .name = "Out R",
-        .min = 1,
-        .max = 28,
-        .def = 14,
-        .unit = kNT_unitAudioOutput,
-        .scaling = 0,
-        .enumStrings = NULL
-    };
-
-    // Output Mode
-    allParameters[idx++] = {
-        .name = "Mode",
-        .min = 0,
-        .max = 1,
-        .def = 1,
-        .unit = kNT_unitOutputMode,
-        .scaling = 0,
-        .enumStrings = NULL
-    };
-
-    // Master Level
-    allParameters[idx++] = {
-        .name = "Level",
-        .min = 0,
-        .max = 100,
-        .def = 80,
-        .unit = kNT_unitPercent,
-        .scaling = 0,
-        .enumStrings = NULL
-    };
-
-    // Lookahead (0.5ms to 20ms, stored as 5-200 with scaling/10)
-    allParameters[idx++] = {
-        .name = "Lookahead",
-        .min = 5,
-        .max = 200,
-        .def = 50,
-        .unit = kNT_unitMs,
-        .scaling = kNT_scaling10,
-        .enumStrings = NULL
-    };
-
-    // Saturation type
-    allParameters[idx++] = {
-        .name = "Saturation",
-        .min = 0,
-        .max = 2,
-        .def = 0,
-        .unit = kNT_unitEnum,
-        .scaling = 0,
-        .enumStrings = saturationStrings
-    };
-}
+struct _seymourDTC {
+    float envelope;
+    float gainReduction;
+    uint32_t writeIndex;
+    uint32_t lookaheadSamples;
+    uint32_t bufferSize;
+    uint32_t feedbackWriteIndex;
+    uint32_t feedbackDelaySamples;
+    uint32_t feedbackBufferSize;
+    float dcBlockerCoeff;
+    float envelopeAttack;
+    float envelopeRelease;
+    float smoothingCoeff;
+    float gainSmoothingCoeff;
+};
 
 /**
- * Build parameter pages based on numInputs
+ * Main algorithm structure - contains parameter storage
  */
-static void buildParameterPages(int numInputs) {
-    // Build channel pages
-    for (int ch = 0; ch < numInputs; ++ch) {
-        for (int p = 0; p < kParamsPerChannel; ++p) {
-            channelPageParams[ch][p] = CHANNEL_PARAM(ch, p);
+struct _seymourAlgorithm : public _NT_algorithm
+{
+    _seymourAlgorithm(int32_t numChannels_);
+    ~_seymourAlgorithm() {}
+
+    // Configuration
+    int32_t numChannels;
+
+    // Memory pointers
+    _seymourDTC* dtc;
+    float* lookaheadBuffer;
+    float* feedbackDelayBuffer;
+
+    // Per-channel DSP state
+    float feedbackSmoothed[kMaxChannels];
+    float panSmoothed[kMaxChannels];
+    float feedbackState[kMaxChannels];
+    float dcBlockerX1[kMaxChannels];
+    float dcBlockerY1[kMaxChannels];
+    float masterLevelSmoothed;
+
+    // Parameter storage - INSIDE the struct (key difference!)
+    _NT_parameter       parameterDefs[kMaxChannels * kNumPerChannelParameters + kNumGlobalParameters];
+    _NT_parameterPages  pagesDefs;
+    _NT_parameterPage   pageDefs[kMaxChannels + 2];  // +2 for Seymour + Routing pages
+    uint8_t             channelPageParams[kMaxChannels][kNumPerChannelParameters];
+    uint8_t             seymourPageParams[kNumGlobalParameters - 3];
+    uint8_t             routingPageParams[3];
+};
+
+/**
+ * Constructor - builds parameters dynamically based on numChannels
+ */
+_seymourAlgorithm::_seymourAlgorithm(int32_t numChannels_)
+    : numChannels(numChannels_)
+{
+    // Initialize DSP state
+    for (int i = 0; i < kMaxChannels; ++i) {
+        feedbackSmoothed[i] = 0.0f;
+        panSmoothed[i] = 0.0f;
+        feedbackState[i] = 0.0f;
+        dcBlockerX1[i] = 0.0f;
+        dcBlockerY1[i] = 0.0f;
+    }
+    masterLevelSmoothed = 0.8f;
+
+    // Build per-channel parameters
+    for (int32_t ch = 0; ch < numChannels; ++ch) {
+        int baseIdx = ch * kNumPerChannelParameters;
+
+        // Copy per-channel parameter templates
+        memcpy(parameterDefs + baseIdx, perChannelParameters,
+               kNumPerChannelParameters * sizeof(_NT_parameter));
+
+        // Set default input to sequential busses
+        parameterDefs[baseIdx + kChParamInput].def = ch + 1;
+
+        // Build channel page
+        pageDefs[ch].name = channelPageNames[ch];
+        pageDefs[ch].numParams = kNumPerChannelParameters;
+        pageDefs[ch].params = channelPageParams[ch];
+
+        for (int p = 0; p < kNumPerChannelParameters; ++p) {
+            channelPageParams[ch][p] = baseIdx + p;
         }
-        allPages[ch].name = channelPageNames[ch];
-        allPages[ch].numParams = kParamsPerChannel;
-        allPages[ch].params = channelPageParams[ch];
     }
 
-    // Build output page
-    for (int p = 0; p < kNumGlobalParams; ++p) {
-        outputPageParams[p] = GLOBAL_PARAM_IDX(numInputs, p);
-    }
-    allPages[numInputs].name = "Output";
-    allPages[numInputs].numParams = kNumGlobalParams;
-    allPages[numInputs].params = outputPageParams;
+    // Add global parameters at the end
+    int globalBase = numChannels * kNumPerChannelParameters;
+    memcpy(parameterDefs + globalBase, globalParameters,
+           kNumGlobalParameters * sizeof(_NT_parameter));
 
-    // Setup parameter pages struct
-    parameterPages.numPages = numInputs + 1;
-    parameterPages.pages = allPages;
+    // Build Seymour (algorithm-global) page
+    pageDefs[numChannels].name = "Seymour";
+    pageDefs[numChannels].numParams = ARRAY_SIZE(seymourPageParams);
+    pageDefs[numChannels].params = seymourPageParams;
+    seymourPageParams[0] = globalBase + kParamMasterLevel;
+    seymourPageParams[1] = globalBase + kParamLookahead;
+    seymourPageParams[2] = globalBase + kParamSaturation;
+    seymourPageParams[3] = globalBase + kParamFeedbackDelay;
+    seymourPageParams[4] = globalBase + kParamSquash;
+
+    // Build routing page (I/O and output mode)
+    pageDefs[numChannels + 1].name = "Routing";
+    pageDefs[numChannels + 1].numParams = ARRAY_SIZE(routingPageParams);
+    pageDefs[numChannels + 1].params = routingPageParams;
+    routingPageParams[0] = globalBase + kParamOutputL;
+    routingPageParams[1] = globalBase + kParamOutputR;
+    routingPageParams[2] = globalBase + kParamOutputMode;
+
+    // Setup pages structure
+    pagesDefs.numPages = numChannels + 2;
+    pagesDefs.pages = pageDefs;
+
+    // Set _NT_algorithm members
+    parameters = parameterDefs;
+    parameterPages = &pagesDefs;
 }
+
+// ============================================================================
+// SPECIFICATIONS
+// ============================================================================
+
+static const _NT_specification specifications[] = {
+    { .name = "Inputs", .min = 1, .max = kMaxChannels, .def = 2, .type = kNT_typeGeneric },
+};
 
 // ============================================================================
 // FACTORY FUNCTIONS
 // ============================================================================
 
-/**
- * Calculate memory requirements
- */
 void calculateRequirements(_NT_algorithmRequirements& req, const int32_t* specs) {
-    int numInputs = specs[0];
-    int numParams = numInputs * kParamsPerChannel + kNumGlobalParams;
+    int32_t numChannels = specs[0];
 
-    // SRAM: algorithm struct + per-channel arrays
-    // feedbackSmoothed, panSmoothed, feedbackState, dcBlockerX1, dcBlockerY1
-    int perChannelArrays = numInputs * sizeof(float) * 5;
-
-    req.numParameters = numParams;
-    req.sram = sizeof(_seymourAlgorithm) + perChannelArrays;
-    req.dram = kMaxLookaheadSamples * 2 * sizeof(float);  // Stereo interleaved
+    req.numParameters = numChannels * kNumPerChannelParameters + kNumGlobalParameters;
+    req.sram = sizeof(_seymourAlgorithm);
+    req.dram = (kMaxLookaheadSamples * 2 + kMaxFeedbackDelaySamples * kMaxChannels) * sizeof(float);
     req.dtc = sizeof(_seymourDTC);
     req.itc = 0;
 }
 
-/**
- * Construct algorithm instance
- */
 _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
-                        const _NT_algorithmRequirements& req,
-                        const int32_t* specs) {
-    int numInputs = specs[0];
+                         const _NT_algorithmRequirements& req,
+                         const int32_t* specs) {
+    int32_t numChannels = specs[0];
 
-    // Build parameters and pages for this instance
-    buildParameters(numInputs);
-    buildParameterPages(numInputs);
-
-    // Create algorithm in SRAM
-    _seymourAlgorithm* alg = new (ptrs.sram) _seymourAlgorithm();
-
-    alg->parameters = allParameters;
-    alg->parameterPages = &parameterPages;
-    alg->numInputs = numInputs;
-
-    // Allocate per-channel arrays after struct
-    uint8_t* sramPtr = ptrs.sram + sizeof(_seymourAlgorithm);
-
-    alg->feedbackSmoothed = (float*)sramPtr;
-    sramPtr += numInputs * sizeof(float);
-
-    alg->panSmoothed = (float*)sramPtr;
-    sramPtr += numInputs * sizeof(float);
-
-    alg->feedbackState = (float*)sramPtr;
-    sramPtr += numInputs * sizeof(float);
-
-    alg->dcBlockerX1 = (float*)sramPtr;
-    sramPtr += numInputs * sizeof(float);
-
-    alg->dcBlockerY1 = (float*)sramPtr;
-    sramPtr += numInputs * sizeof(float);
-
-    // Zero all per-channel state
-    for (int ch = 0; ch < numInputs; ++ch) {
-        alg->feedbackSmoothed[ch] = 0.0f;
-        alg->panSmoothed[ch] = 0.0f;
-        alg->feedbackState[ch] = 0.0f;
-        alg->dcBlockerX1[ch] = 0.0f;
-        alg->dcBlockerY1[ch] = 0.0f;
-    }
-    alg->masterLevelSmoothed = 0.8f;
+    // Create algorithm with constructor that builds parameters
+    _seymourAlgorithm* alg = new (ptrs.sram) _seymourAlgorithm(numChannels);
 
     // Setup DTC
     alg->dtc = (_seymourDTC*)ptrs.dtc;
@@ -502,100 +347,89 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     dtc->envelope = 0.0f;
     dtc->gainReduction = 1.0f;
     dtc->writeIndex = 0;
+    dtc->bufferSize = kMaxLookaheadSamples;
+    dtc->feedbackWriteIndex = 0;
+    dtc->feedbackBufferSize = kMaxFeedbackDelaySamples;
 
-    // Precompute coefficients based on sample rate
+    // Precompute coefficients
     float sr = NT_globals.sampleRate;
-
-    // DC blocker: R = 1 - (2*pi*fc/sr), fc ~= 5Hz
     dtc->dcBlockerCoeff = 1.0f - (6.28318f * 5.0f / sr);
-
-    // Parameter smoothing: ~50Hz
     dtc->smoothingCoeff = 1.0f - expf(-6.28318f * 50.0f / sr);
-
-    // Limiter envelope: fast attack (~1ms), slower release (~20ms)
     dtc->envelopeAttack = 1.0f - expf(-6.28318f * 1000.0f / sr);
     dtc->envelopeRelease = 1.0f - expf(-6.28318f * 50.0f / sr);
-
-    // Gain smoothing (slightly slower than parameter smoothing)
     dtc->gainSmoothingCoeff = 1.0f - expf(-6.28318f * 30.0f / sr);
+    dtc->lookaheadSamples = (uint32_t)(sr * 0.005f);  // 5ms default
+    dtc->feedbackDelaySamples = (uint32_t)(sr * 0.005f);  // 5ms default
 
-    // Default lookahead: 5ms
-    dtc->lookaheadSamples = (uint32_t)(sr * 0.005f);
-    dtc->bufferSize = kMaxLookaheadSamples;
-
-    // Setup DRAM (lookahead buffer)
+    // Setup lookahead buffer
     alg->lookaheadBuffer = (float*)ptrs.dram;
     memset(alg->lookaheadBuffer, 0, kMaxLookaheadSamples * 2 * sizeof(float));
+    alg->feedbackDelayBuffer = (float*)(ptrs.dram) + kMaxLookaheadSamples * 2;
+    memset(alg->feedbackDelayBuffer, 0, kMaxFeedbackDelaySamples * kMaxChannels * sizeof(float));
 
     return alg;
 }
 
-/**
- * Parameter UI prefix callback - adds "N:" prefix to channel parameters
- */
 int parameterUiPrefix(_NT_algorithm* self, int p, char* buff) {
     _seymourAlgorithm* pThis = (_seymourAlgorithm*)self;
+    int globalBase = pThis->numChannels * kNumPerChannelParameters;
 
-    if (p < pThis->numInputs * kParamsPerChannel) {
-        int ch = p / kParamsPerChannel;
+    // Only add prefix for per-channel parameters
+    if (p < globalBase) {
+        int ch = p / kNumPerChannelParameters;
         int len = NT_intToString(buff, 1 + ch);
         buff[len++] = ':';
         buff[len] = 0;
         return len;
     }
-    return 0;  // No prefix for global params
+    return 0;
 }
 
-/**
- * Parameter changed callback
- */
 void parameterChanged(_NT_algorithm* self, int p) {
     _seymourAlgorithm* pThis = (_seymourAlgorithm*)self;
     _seymourDTC* dtc = pThis->dtc;
+    int globalBase = pThis->numChannels * kNumPerChannelParameters;
 
-    int globalBase = pThis->numInputs * kParamsPerChannel;
-
-    // Check if it's the lookahead parameter
-    if (p == globalBase + kGlobalParamLookahead) {
-        // Lookahead is stored as 5-200 (0.5ms to 20ms with scaling/10)
+    // Check if lookahead changed
+    if (p == globalBase + kParamLookahead) {
         float lookaheadMs = pThis->v[p] / 10.0f;
         uint32_t samples = (uint32_t)(NT_globals.sampleRate * lookaheadMs / 1000.0f);
-
-        // Clamp to buffer size
         if (samples > dtc->bufferSize) samples = dtc->bufferSize;
         if (samples < 1) samples = 1;
-
         dtc->lookaheadSamples = samples;
+    } else if (p == globalBase + kParamFeedbackDelay) {
+        float delayMs = pThis->v[p] / 10.0f;
+        uint32_t samples = (uint32_t)(NT_globals.sampleRate * delayMs / 1000.0f);
+        if (samples >= dtc->feedbackBufferSize) samples = dtc->feedbackBufferSize - 1;
+        if (samples < 1) samples = 1;
+        dtc->feedbackDelaySamples = samples;
     }
 }
 
-/**
- * Main audio processing
- */
 void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     _seymourAlgorithm* pThis = (_seymourAlgorithm*)self;
     _seymourDTC* dtc = pThis->dtc;
 
     int numFrames = numFramesBy4 * 4;
-    int numInputs = pThis->numInputs;
-    int globalBase = numInputs * kParamsPerChannel;
+    int32_t numChannels = pThis->numChannels;
+    int globalBase = numChannels * kNumPerChannelParameters;
 
-    // Get output busses (1-based in params, 0-based for array access)
-    int outLBus = pThis->v[globalBase + kGlobalParamOutputL] - 1;
-    int outRBus = pThis->v[globalBase + kGlobalParamOutputR] - 1;
-    bool replace = pThis->v[globalBase + kGlobalParamOutputMode];
+    // Get output busses
+    int outLBus = pThis->v[globalBase + kParamOutputL] - 1;
+    int outRBus = pThis->v[globalBase + kParamOutputR] - 1;
+    bool replace = pThis->v[globalBase + kParamOutputMode];
 
     float* outL = busFrames + outLBus * numFrames;
     float* outR = busFrames + outRBus * numFrames;
 
     // Get global parameters
-    float masterTarget = pThis->v[globalBase + kGlobalParamMasterLevel] / 100.0f;
-    int satMode = pThis->v[globalBase + kGlobalParamSaturation];
-
-    // Lookahead buffer
-    float* delayBuf = pThis->lookaheadBuffer;
-    uint32_t bufSize = dtc->bufferSize;
-    uint32_t lookahead = dtc->lookaheadSamples;
+    float masterTarget = pThis->v[globalBase + kParamMasterLevel] / 100.0f;
+    int satMode = pThis->v[globalBase + kParamSaturation];
+    float squash = pThis->v[globalBase + kParamSquash] / 100.0f;
+    if (squash < 0.0f) squash = 0.0f;
+    if (squash > 1.0f) squash = 1.0f;
+    float limiterThresholdVolts =
+        kLimiterThresholdMaxVolts - (kLimiterThresholdMaxVolts - kLimiterThresholdMinVolts) * squash;
 
     // Coefficients
     float dcCoeff = dtc->dcBlockerCoeff;
@@ -604,27 +438,40 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     float attackCoeff = dtc->envelopeAttack;
     float releaseCoeff = dtc->envelopeRelease;
 
+    // Lookahead buffer
+    float* delayBuf = pThis->lookaheadBuffer;
+    uint32_t bufSize = dtc->bufferSize;
+    uint32_t lookahead = dtc->lookaheadSamples;
+
+    // Feedback delay buffer (shared write index, per-channel lanes)
+    float* feedbackDelayBuf = pThis->feedbackDelayBuffer;
+    uint32_t fbBufSize = dtc->feedbackBufferSize;
+    uint32_t fbDelay = dtc->feedbackDelaySamples;
+
     // Process each sample
     for (int i = 0; i < numFrames; ++i) {
         float mixL = 0.0f;
         float mixR = 0.0f;
 
-        // Process each input channel
-        for (int ch = 0; ch < numInputs; ++ch) {
-            int paramBase = ch * kParamsPerChannel;
+        uint32_t fbWriteIdx = dtc->feedbackWriteIndex;
+        uint32_t fbReadIdx = (fbWriteIdx + fbBufSize - fbDelay) % fbBufSize;
 
-            // Get input sample
+        // Process each channel
+        for (int32_t ch = 0; ch < numChannels; ++ch) {
+            int paramBase = ch * kNumPerChannelParameters;
+
+            // Get input
             int inBus = pThis->v[paramBase + kChParamInput] - 1;
             float input = (inBus >= 0) ? busFrames[inBus * numFrames + i] : 0.0f;
 
-            // Get feedback amount with CV modulation
+            // Get feedback with CV
             float fbBase = pThis->v[paramBase + kChParamFeedback] / 100.0f;
             int fbCVBus = pThis->v[paramBase + kChParamFeedbackCV] - 1;
             float fbCVDepth = pThis->v[paramBase + kChParamFeedbackCVDepth] / 100.0f;
 
             if (fbCVBus >= 0) {
-                float cv = busFrames[fbCVBus * numFrames + i] / 5.0f;  // ±5V → ±1
-                cv = cv * 0.5f + 0.5f;  // Convert to 0-1
+                float cv = busFrames[fbCVBus * numFrames + i] / 5.0f;
+                cv = cv * 0.5f + 0.5f;
                 if (cv < 0.0f) cv = 0.0f;
                 if (cv > 1.0f) cv = 1.0f;
                 fbBase = fbBase * (1.0f - fbCVDepth) + cv * fbCVDepth;
@@ -632,24 +479,20 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
             // Smooth feedback
             pThis->feedbackSmoothed[ch] += smoothCoeff * (fbBase - pThis->feedbackSmoothed[ch]);
-            float feedback = pThis->feedbackSmoothed[ch];
 
-            // Apply feedback + DC block
-            float feedbackSample = pThis->feedbackState[ch] * feedback;
-            float mixed = input + feedbackSample;
-            float processed = dcBlock(mixed,
-                                      pThis->dcBlockerX1[ch],
-                                      pThis->dcBlockerY1[ch],
-                                      dcCoeff);
-            pThis->feedbackState[ch] = processed;
+            // Apply feedback (DC-blocked in the feedback path only)
+            float feedbackTap = feedbackDelayBuf[fbReadIdx * kMaxChannels + ch];
+            float feedbackFiltered = dcBlock(feedbackTap, pThis->dcBlockerX1[ch], pThis->dcBlockerY1[ch], dcCoeff);
+            float processed = input + feedbackFiltered * pThis->feedbackSmoothed[ch];
+            feedbackDelayBuf[fbWriteIdx * kMaxChannels + ch] = processed;
 
-            // Get pan with CV modulation
+            // Get pan with CV
             float panBase = (float)pThis->v[paramBase + kChParamPan];
             int panCVBus = pThis->v[paramBase + kChParamPanCV] - 1;
             float panCVDepth = pThis->v[paramBase + kChParamPanCVDepth] / 100.0f;
 
             if (panCVBus >= 0) {
-                float cv = busFrames[panCVBus * numFrames + i] / 5.0f;  // ±5V → ±1
+                float cv = busFrames[panCVBus * numFrames + i] / 5.0f;
                 panBase += cv * 100.0f * panCVDepth;
                 if (panBase < -100.0f) panBase = -100.0f;
                 if (panBase > 100.0f) panBase = 100.0f;
@@ -666,53 +509,50 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             mixR += processed * gainR;
         }
 
-        // Apply master level (smoothed)
+        dtc->feedbackWriteIndex = (dtc->feedbackWriteIndex + 1) % fbBufSize;
+
+        // Master level
         pThis->masterLevelSmoothed += smoothCoeff * (masterTarget - pThis->masterLevelSmoothed);
         mixL *= pThis->masterLevelSmoothed;
         mixR *= pThis->masterLevelSmoothed;
 
-        // === Lookahead Limiter ===
-
-        // Write current sample to delay buffer
+        // Lookahead limiter
         uint32_t writeIdx = dtc->writeIndex;
         delayBuf[writeIdx * 2] = mixL;
         delayBuf[writeIdx * 2 + 1] = mixR;
 
-        // Read delayed sample
         uint32_t readIdx = (writeIdx + bufSize - lookahead) % bufSize;
         float delayedL = delayBuf[readIdx * 2];
         float delayedR = delayBuf[readIdx * 2 + 1];
 
-        // Envelope follower on input (not delayed) - use max of L/R
         float absL = mixL > 0 ? mixL : -mixL;
         float absR = mixR > 0 ? mixR : -mixR;
         float peakIn = absL > absR ? absL : absR;
 
-        // Attack/release envelope
         float envCoeff = (peakIn > dtc->envelope) ? attackCoeff : releaseCoeff;
         dtc->envelope += envCoeff * (peakIn - dtc->envelope);
 
-        // Calculate target gain reduction
         float targetGain = 1.0f;
-        if (dtc->envelope > kLimiterThreshold) {
-            targetGain = kLimiterThreshold / dtc->envelope;
+        if (dtc->envelope > limiterThresholdVolts) {
+            targetGain = limiterThresholdVolts / dtc->envelope;
         }
 
-        // Smooth gain changes
         dtc->gainReduction += gainSmoothCoeff * (targetGain - dtc->gainReduction);
 
-        // Apply gain reduction to delayed signal
         float limitedL = delayedL * dtc->gainReduction;
         float limitedR = delayedR * dtc->gainReduction;
 
-        // Apply saturation for any remaining peaks
-        float finalL = saturate(limitedL, satMode);
-        float finalR = saturate(limitedR, satMode);
+        float finalL = limitedL;
+        float finalR = limitedR;
+        if (dtc->gainReduction < 0.9999f || dtc->envelope > limiterThresholdVolts) {
+            float normL = limitedL / limiterThresholdVolts;
+            float normR = limitedR / limiterThresholdVolts;
+            finalL = saturate(normL, satMode) * limiterThresholdVolts;
+            finalR = saturate(normR, satMode) * limiterThresholdVolts;
+        }
 
-        // Advance write index
         dtc->writeIndex = (writeIdx + 1) % bufSize;
 
-        // Output
         if (replace) {
             outL[i] = finalL;
             outR[i] = finalR;
@@ -724,11 +564,11 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 }
 
 // ============================================================================
-// FACTORY DEFINITION
+// FACTORY
 // ============================================================================
 
 static const _NT_factory factory = {
-    .guid = NT_MULTICHAR('N', 's', 'S', 'y'),  // Nealsanche + Seymour
+    .guid = NT_MULTICHAR('T', 'h', 'S', 'y'),  // Thorinside + Seymour
     .name = "Seymour",
     .description = "Feedback mixer with safety limiter",
     .numSpecifications = ARRAY_SIZE(specifications),
@@ -753,7 +593,7 @@ static const _NT_factory factory = {
 };
 
 // ============================================================================
-// PLUGIN ENTRY POINT
+// ENTRY POINT
 // ============================================================================
 
 uintptr_t pluginEntry(_NT_selector selector, uint32_t data) {
