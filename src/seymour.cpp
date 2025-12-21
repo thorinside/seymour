@@ -282,9 +282,9 @@ _seymourAlgorithm::_seymourAlgorithm(int32_t numChannels_)
     int globalBase = numChannels * kNumPerChannelParameters;
     memcpy(parameterDefs + globalBase, globalParameters,
            kNumGlobalParameters * sizeof(_NT_parameter));
-    // Default both output modes to Replace
-    parameterDefs[globalBase + kParamOutputLMode].def = 1;
-    parameterDefs[globalBase + kParamOutputRMode].def = 1;
+    // Default both output modes to Add
+    parameterDefs[globalBase + kParamOutputLMode].def = 0;
+    parameterDefs[globalBase + kParamOutputRMode].def = 0;
 
     // Build Seymour (algorithm-global) page
     pageDefs[numChannels].name = "Seymour";
