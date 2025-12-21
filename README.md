@@ -25,7 +25,7 @@ Feedback mixer with a safety limiter (“squash”) and per-channel panning.
 
 ### `Routing` page
 - `Out L`, `Out R`: audio output busses
-- `Mode`: Add/Replace output mode
+- `Out L mode`, `Out R mode`: Add/Replace output mode for each output
 
 ## Notes
 - With `Feedback = 0`, the dry input path is intended to be essentially unchanged (no “always-on” DC blocking of the dry signal).
@@ -34,4 +34,3 @@ Feedback mixer with a safety limiter (“squash”) and per-channel panning.
 ## Build
 - Hardware (`.o` for SD card): `make hardware`
 - Desktop (`.dylib` for `nt_emu`): `make test`
-

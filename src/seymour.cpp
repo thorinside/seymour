@@ -62,8 +62,9 @@ static const int kMaxFeedbackDelaySamples = (96000 * 20) / 1000;
 // Global parameters (at the end)
 enum GlobalParams {
     kParamOutputL,
+    kParamOutputLMode,
     kParamOutputR,
-    kParamOutputMode,
+    kParamOutputRMode,
     kParamMasterLevel,
     kParamLookahead,
     kParamSaturation,
@@ -101,9 +102,8 @@ static const char* saturationStrings[] = { "Soft", "Tube", "Hard", NULL };
 
 // Global parameters template
 static const _NT_parameter globalParameters[] = {
-    { .name = "Out L", .min = 1, .max = 28, .def = 13, .unit = kNT_unitAudioOutput, .scaling = 0, .enumStrings = NULL },
-    { .name = "Out R", .min = 1, .max = 28, .def = 14, .unit = kNT_unitAudioOutput, .scaling = 0, .enumStrings = NULL },
-    { .name = "Mode", .min = 0, .max = 1, .def = 1, .unit = kNT_unitOutputMode, .scaling = 0, .enumStrings = NULL },
+    NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE("Out L", 1, 13)
+    NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE("Out R", 1, 14)
     { .name = "Level", .min = 0, .max = 100, .def = 100, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
     { .name = "Lookahead", .min = 5, .max = 200, .def = 50, .unit = kNT_unitMs, .scaling = kNT_scaling10, .enumStrings = NULL },
     { .name = "Saturation", .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = saturationStrings },
@@ -237,8 +237,8 @@ struct _seymourAlgorithm : public _NT_algorithm
     _NT_parameterPages  pagesDefs;
     _NT_parameterPage   pageDefs[kMaxChannels + 2];  // +2 for Seymour + Routing pages
     uint8_t             channelPageParams[kMaxChannels][kNumPerChannelParameters];
-    uint8_t             seymourPageParams[kNumGlobalParameters - 3];
-    uint8_t             routingPageParams[3];
+    uint8_t             seymourPageParams[5];
+    uint8_t             routingPageParams[4];
 };
 
 /**
@@ -282,6 +282,9 @@ _seymourAlgorithm::_seymourAlgorithm(int32_t numChannels_)
     int globalBase = numChannels * kNumPerChannelParameters;
     memcpy(parameterDefs + globalBase, globalParameters,
            kNumGlobalParameters * sizeof(_NT_parameter));
+    // Default both output modes to Replace
+    parameterDefs[globalBase + kParamOutputLMode].def = 1;
+    parameterDefs[globalBase + kParamOutputRMode].def = 1;
 
     // Build Seymour (algorithm-global) page
     pageDefs[numChannels].name = "Seymour";
@@ -298,8 +301,9 @@ _seymourAlgorithm::_seymourAlgorithm(int32_t numChannels_)
     pageDefs[numChannels + 1].numParams = ARRAY_SIZE(routingPageParams);
     pageDefs[numChannels + 1].params = routingPageParams;
     routingPageParams[0] = globalBase + kParamOutputL;
-    routingPageParams[1] = globalBase + kParamOutputR;
-    routingPageParams[2] = globalBase + kParamOutputMode;
+    routingPageParams[1] = globalBase + kParamOutputLMode;
+    routingPageParams[2] = globalBase + kParamOutputR;
+    routingPageParams[3] = globalBase + kParamOutputRMode;
 
     // Setup pages structure
     pagesDefs.numPages = numChannels + 2;
@@ -417,7 +421,8 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     // Get output busses
     int outLBus = pThis->v[globalBase + kParamOutputL] - 1;
     int outRBus = pThis->v[globalBase + kParamOutputR] - 1;
-    bool replace = pThis->v[globalBase + kParamOutputMode];
+    bool replaceL = pThis->v[globalBase + kParamOutputLMode];
+    bool replaceR = pThis->v[globalBase + kParamOutputRMode];
 
     float* outL = busFrames + outLBus * numFrames;
     float* outR = busFrames + outRBus * numFrames;
@@ -553,13 +558,11 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
         dtc->writeIndex = (writeIdx + 1) % bufSize;
 
-        if (replace) {
-            outL[i] = finalL;
-            outR[i] = finalR;
-        } else {
-            outL[i] += finalL;
-            outR[i] += finalR;
-        }
+        if (replaceL) outL[i] = finalL;
+        else outL[i] += finalL;
+
+        if (replaceR) outR[i] = finalR;
+        else outR[i] += finalR;
     }
 }
 
