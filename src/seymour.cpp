@@ -66,6 +66,7 @@ enum GlobalParams {
     kParamOutputR,
     kParamOutputRMode,
     kParamMasterLevel,
+    kParamCascade,       // Global cascade feedback amount (0-150%)
     kParamLookahead,
     kParamSaturation,
     kParamFeedbackDelay,
@@ -77,9 +78,6 @@ enum GlobalParams {
 // Per-channel parameters
 enum ChannelParams {
     kChParamInput,
-    kChParamFeedback,
-    kChParamFeedbackCV,
-    kChParamFeedbackCVDepth,
     kChParamPan,
     kChParamPanCV,
     kChParamPanCVDepth,
@@ -105,6 +103,8 @@ static const _NT_parameter globalParameters[] = {
     NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE("Out L", 1, 13)
     NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE("Out R", 1, 14)
     { .name = "Level", .min = 0, .max = 100, .def = 100, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+    // Cascade: 0-150%, >100% allows self-oscillation/building
+    { .name = "Cascade", .min = 0, .max = 150, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
     { .name = "Lookahead", .min = 5, .max = 200, .def = 50, .unit = kNT_unitMs, .scaling = kNT_scaling10, .enumStrings = NULL },
     { .name = "Saturation", .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = saturationStrings },
     { .name = "FB Delay", .min = 5, .max = 200, .def = 50, .unit = kNT_unitMs, .scaling = kNT_scaling10, .enumStrings = NULL },
@@ -115,9 +115,6 @@ static const _NT_parameter globalParameters[] = {
 // Per-channel parameters template
 static const _NT_parameter perChannelParameters[] = {
     { .name = "Input", .min = 0, .max = 28, .def = 1, .unit = kNT_unitAudioInput, .scaling = 0, .enumStrings = NULL },
-    { .name = "Feedback", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
-    { .name = "FB CV", .min = 0, .max = 28, .def = 0, .unit = kNT_unitCvInput, .scaling = 0, .enumStrings = NULL },
-    { .name = "FB Depth", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
     { .name = "Pan", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
     { .name = "Pan CV", .min = 0, .max = 28, .def = 0, .unit = kNT_unitCvInput, .scaling = 0, .enumStrings = NULL },
     { .name = "Pan Depth", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
@@ -225,19 +222,21 @@ struct _seymourAlgorithm : public _NT_algorithm
     float* feedbackDelayBuffer;
 
     // Per-channel DSP state
-    float feedbackSmoothed[kMaxChannels];
     float panSmoothed[kMaxChannels];
-    float feedbackState[kMaxChannels];
     float dcBlockerX1[kMaxChannels];
     float dcBlockerY1[kMaxChannels];
+
+    // Global DSP state
     float masterLevelSmoothed;
+    float cascadeSmoothed;
+    float squashSmoothed;
 
     // Parameter storage - INSIDE the struct (key difference!)
     _NT_parameter       parameterDefs[kMaxChannels * kNumPerChannelParameters + kNumGlobalParameters];
     _NT_parameterPages  pagesDefs;
     _NT_parameterPage   pageDefs[kMaxChannels + 2];  // +2 for Seymour + Routing pages
     uint8_t             channelPageParams[kMaxChannels][kNumPerChannelParameters];
-    uint8_t             seymourPageParams[5];
+    uint8_t             seymourPageParams[6];  // Level, Cascade, Lookahead, Saturation, FB Delay, Squash
     uint8_t             routingPageParams[4];
 };
 
@@ -249,13 +248,13 @@ _seymourAlgorithm::_seymourAlgorithm(int32_t numChannels_)
 {
     // Initialize DSP state
     for (int i = 0; i < kMaxChannels; ++i) {
-        feedbackSmoothed[i] = 0.0f;
         panSmoothed[i] = 0.0f;
-        feedbackState[i] = 0.0f;
         dcBlockerX1[i] = 0.0f;
         dcBlockerY1[i] = 0.0f;
     }
-    masterLevelSmoothed = 0.8f;
+    masterLevelSmoothed = 1.0f;
+    cascadeSmoothed = 0.0f;  // Default 0% (no feedback)
+    squashSmoothed = 0.56f;  // Default 56%
 
     // Build per-channel parameters
     for (int32_t ch = 0; ch < numChannels; ++ch) {
@@ -291,10 +290,11 @@ _seymourAlgorithm::_seymourAlgorithm(int32_t numChannels_)
     pageDefs[numChannels].numParams = ARRAY_SIZE(seymourPageParams);
     pageDefs[numChannels].params = seymourPageParams;
     seymourPageParams[0] = globalBase + kParamMasterLevel;
-    seymourPageParams[1] = globalBase + kParamLookahead;
-    seymourPageParams[2] = globalBase + kParamSaturation;
-    seymourPageParams[3] = globalBase + kParamFeedbackDelay;
-    seymourPageParams[4] = globalBase + kParamSquash;
+    seymourPageParams[1] = globalBase + kParamCascade;
+    seymourPageParams[2] = globalBase + kParamLookahead;
+    seymourPageParams[3] = globalBase + kParamSaturation;
+    seymourPageParams[4] = globalBase + kParamFeedbackDelay;
+    seymourPageParams[5] = globalBase + kParamSquash;
 
     // Build routing page (I/O and output mode)
     pageDefs[numChannels + 1].name = "Routing";
@@ -429,12 +429,11 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
     // Get global parameters
     float masterTarget = pThis->v[globalBase + kParamMasterLevel] / 100.0f;
+    float cascadeTarget = pThis->v[globalBase + kParamCascade] / 100.0f;  // 0-1.5 (150%)
     int satMode = pThis->v[globalBase + kParamSaturation];
-    float squash = pThis->v[globalBase + kParamSquash] / 100.0f;
-    if (squash < 0.0f) squash = 0.0f;
-    if (squash > 1.0f) squash = 1.0f;
-    float limiterThresholdVolts =
-        kLimiterThresholdMaxVolts - (kLimiterThresholdMaxVolts - kLimiterThresholdMinVolts) * squash;
+    float squashTarget = pThis->v[globalBase + kParamSquash] / 100.0f;
+    if (squashTarget < 0.0f) squashTarget = 0.0f;
+    if (squashTarget > 1.0f) squashTarget = 1.0f;
 
     // Coefficients
     float dcCoeff = dtc->dcBlockerCoeff;
@@ -458,6 +457,12 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         float mixL = 0.0f;
         float mixR = 0.0f;
 
+        // Smooth global parameters (once per sample, not per channel)
+        pThis->cascadeSmoothed += smoothCoeff * (cascadeTarget - pThis->cascadeSmoothed);
+        pThis->squashSmoothed += smoothCoeff * (squashTarget - pThis->squashSmoothed);
+        float limiterThresholdVolts =
+            kLimiterThresholdMaxVolts - (kLimiterThresholdMaxVolts - kLimiterThresholdMinVolts) * pThis->squashSmoothed;
+
         uint32_t fbWriteIdx = dtc->feedbackWriteIndex;
         uint32_t fbReadIdx = (fbWriteIdx + fbBufSize - fbDelay) % fbBufSize;
 
@@ -469,26 +474,17 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             int inBus = pThis->v[paramBase + kChParamInput] - 1;
             float input = (inBus >= 0) ? busFrames[inBus * numFrames + i] : 0.0f;
 
-            // Get feedback with CV
-            float fbBase = pThis->v[paramBase + kChParamFeedback] / 100.0f;
-            int fbCVBus = pThis->v[paramBase + kChParamFeedbackCV] - 1;
-            float fbCVDepth = pThis->v[paramBase + kChParamFeedbackCVDepth] / 100.0f;
+            // Cascade topology: each channel receives feedback from the previous channel
+            // Ch 0 <- Ch N-1, Ch 1 <- Ch 0, Ch 2 <- Ch 1, etc. (ring)
+            int feedbackSourceCh = (ch - 1 + numChannels) % numChannels;
+            float feedbackTap = feedbackDelayBuf[fbReadIdx * kMaxChannels + feedbackSourceCh];
 
-            if (fbCVBus >= 0) {
-                float cv = busFrames[fbCVBus * numFrames + i] / 5.0f;
-                cv = cv * 0.5f + 0.5f;
-                if (cv < 0.0f) cv = 0.0f;
-                if (cv > 1.0f) cv = 1.0f;
-                fbBase = fbBase * (1.0f - fbCVDepth) + cv * fbCVDepth;
-            }
-
-            // Smooth feedback
-            pThis->feedbackSmoothed[ch] += smoothCoeff * (fbBase - pThis->feedbackSmoothed[ch]);
-
-            // Apply feedback (DC-blocked in the feedback path only)
-            float feedbackTap = feedbackDelayBuf[fbReadIdx * kMaxChannels + ch];
+            // DC blocker on feedback to prevent runaway
             float feedbackFiltered = dcBlock(feedbackTap, pThis->dcBlockerX1[ch], pThis->dcBlockerY1[ch], dcCoeff);
-            float processed = input + feedbackFiltered * pThis->feedbackSmoothed[ch];
+
+            // Add cascade feedback from previous channel
+            float processed = input + feedbackFiltered * pThis->cascadeSmoothed;
+
             feedbackDelayBuf[fbWriteIdx * kMaxChannels + ch] = processed;
 
             // Get pan with CV
@@ -517,9 +513,8 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         dtc->feedbackWriteIndex = (dtc->feedbackWriteIndex + 1) % fbBufSize;
 
         // Master level
-        pThis->masterLevelSmoothed += smoothCoeff * (masterTarget - pThis->masterLevelSmoothed);
-        mixL *= pThis->masterLevelSmoothed;
-        mixR *= pThis->masterLevelSmoothed;
+        mixL *= masterTarget;
+        mixR *= masterTarget;
 
         // Lookahead limiter
         uint32_t writeIdx = dtc->writeIndex;
